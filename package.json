@@ -1,0 +1,11 @@
+{
+  "name": "automerge",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "license": "ISC",
+  "dependencies": {
+    "automerge": "0.14.0",
+    "ws": "^8.18.3"
+  }
+}

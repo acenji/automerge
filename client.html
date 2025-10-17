@@ -1,0 +1,226 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Acenji Manifest — Automerge 0.14 (string FULL)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <style>
+    body { font-family: system-ui, sans-serif; padding: 16px; }
+    pre { background:#111; color:#0f0; padding:8px; max-height:300px; overflow:auto; }
+    .row { display:flex; gap:16px; flex-wrap:wrap; }
+    .col { flex:1; min-width:320px; }
+    input, button { padding:8px; }
+    #status { color:#555; }
+  </style>
+</head>
+<body>
+  <h1>Acenji Manifest — FULL wire (string) + ACK</h1>
+
+  <div><strong>Status:</strong> <span id="status">Booting…</span></div>
+
+  <div class="row" style="margin-top:12px">
+    <div class="col">
+      <label>questionText</label><br/>
+      <input id="qtext" value="" style="width:100%"/>
+      <div style="margin-top:8px;">
+        <button id="apply">Apply change</button>
+      </div>
+      <div style="margin-top:12px">
+        <strong>Log</strong>
+        <pre id="log"></pre>
+      </div>
+    </div>
+    <div class="col">
+      <strong>Current Doc</strong>
+      <pre id="docView"></pre>
+    </div>
+  </div>
+
+  <script type="module">
+    // Version banner
+    console.log("[CLIENT vD] loaded", new Date().toISOString());
+
+    // Automerge 0.14
+    const AutomergeNS = await import("https://esm.sh/automerge@0.14.0");
+    const Automerge = AutomergeNS.default ?? AutomergeNS;
+
+    // ----- schema helpers -----
+    const getElem = (doc) => doc?.pages?.[0]?.questionRows?.[0]?.elements?.[0];
+    function ensureElem(d) {
+      if (!d.pages) d.pages = [];
+      if (!d.pages[0]) d.pages[0] = {};
+      if (!d.pages[0].questionRows) d.pages[0].questionRows = [];
+      if (!d.pages[0].questionRows[0]) d.pages[0].questionRows[0] = {};
+      if (!d.pages[0].questionRows[0].elements) d.pages[0].questionRows[0].elements = [];
+      if (!d.pages[0].questionRows[0].elements[0]) d.pages[0].questionRows[0].elements[0] = {};
+      return d.pages[0].questionRows[0].elements[0];
+    }
+    const getText = (doc) => getElem(doc)?.questionText ?? "";
+    const setText = (d, v) => { ensureElem(d).questionText = v; };
+
+    // local seed if user clicks too early
+    const emptySeed = {
+      pages: [{ questionRows: [{ elements: [{ questionText: "" }] }] }],
+      tiles: [], merges: [], actions: [],
+      databases: [], connections: [], styles: { theme: {} }
+    };
+
+    // ----- DOM -----
+    const qtext    = document.getElementById("qtext");
+    const applyBtn = document.getElementById("apply");
+    const statusEl = document.getElementById("status");
+    const logEl    = document.getElementById("log");
+    const docView  = document.getElementById("docView");
+
+    // ----- utils -----
+    const who = () => (navigator.userAgent.includes("Firefox") ? "Firefox" : "Chrome");
+    const ts  = () => new Date().toISOString().split("T")[1].replace("Z","");
+    const hash = (s) => { let h=5381; for (let i=0;i<s.length;i++) h=((h<<5)+h)^s.charCodeAt(i); return (h>>>0).toString(16); };
+    const setStatus = (t) => { statusEl.textContent = t; };
+    const log = (line) => {
+      const out = `[${ts()}] [${who()}] ${line}\n`;
+      logEl.textContent += out;
+      logEl.scrollTop = logEl.scrollHeight;
+      console.log(line);
+    };
+    const render = () => {
+      docView.textContent = JSON.stringify(doc, null, 2);
+      const cur = getText(doc);
+      if (qtext.value !== cur) qtext.value = cur;
+    };
+
+    // ----- state -----
+    const ws = new WebSocket(`ws://${location.host}`);
+    let doc;
+    let wsReady = false;
+    let docReady = false;
+    let lastSentHash = null;
+    let pendingFull = null;
+
+    // ----- open/close -----
+    ws.onopen = () => {
+      wsReady = true;
+      log("WS open");
+      // explicitly request a FULL (in addition to server's initial FULL)
+      ws.send(JSON.stringify({ type: "hello" }));
+    };
+    ws.onclose = (e) => { wsReady = false; log(`WS close ${e.code} ${e.reason||""}`); };
+    ws.onerror = (e) => log(`WS error: ${e?.message||e}`);
+
+    // ----- messages -----
+    ws.onmessage = async (ev) => {
+      let text;
+      if (typeof ev.data === "string") text = ev.data;
+      else if (ev.data instanceof Blob) text = await ev.data.text();
+      else text = new TextDecoder().decode(new Uint8Array(ev.data));
+
+      let msg;
+      try { msg = JSON.parse(text); }
+      catch (e) { log(`JSON parse FAIL: ${e.message}`); return; }
+
+      if (msg.type === "debug_echo") {
+        log(`DEBUG_ECHO: server saw our frame (bytes=${msg.bytes})`);
+        // continue; we still wait for persisted/full
+      }
+
+      if (msg.type === "ping") {
+        log(`ping t=${msg.t}`);
+        return;
+      }
+
+      // Step 4 ACK
+      if (msg.type === "persisted") {
+        const qt = msg?.payload?.questionText ?? "(unknown)";
+        log(`STEP 4 OK: server persisted to disk; questionText="${qt}"`);
+        setStatus("STEP 4 OK: saved to file");
+        return;
+      }
+
+      if (msg.type !== "full") {
+        log(`ignore type=${msg.type}`);
+        return;
+      }
+
+      // FULL → apply (payload is the *string* from Automerge.save())
+      let incomingDoc;
+      try {
+        incomingDoc = Automerge.load(msg.payload);
+      } catch (e) {
+        log(`LOAD FAIL: ${e.message}`);
+        return;
+      }
+
+      const before = doc ? getText(doc) : "(none)";
+      doc = doc ? Automerge.merge(doc, incomingDoc) : incomingDoc;
+      const after = getText(doc);
+      render();
+
+      if (!docReady) {
+        docReady = true;
+        log(`STEP 1 OK: initial FULL loaded. before="${before}" → after="${after}"`);
+        setStatus("Ready");
+        if (pendingFull && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "full", payload: pendingFull }));
+          lastSentHash = hash(pendingFull);
+          log(`STEP 3 FLUSH → sent queued FULL (hash=${lastSentHash})`);
+          pendingFull = null;
+        }
+        return;
+      }
+
+      const incomingHash = hash(msg.payload);
+      if (lastSentHash && incomingHash === lastSentHash) {
+        log(`STEP 5 OK: broadcast round-trip (hash=${incomingHash}); value="${after}"`);
+        setStatus("STEP 5 OK: broadcast applied");
+      } else {
+        log(`STEP 5 (info): FULL received (hash=${incomingHash}); value="${after}"`);
+        setStatus("Snapshot applied");
+      }
+    };
+
+    // ----- Apply button: STEP 2 local → STEP 3 send FULL (string) -----
+    applyBtn.onclick = () => {
+      try {
+        const newVal = qtext.value.trim();
+        const before = doc ? getText(doc) : "(none)";
+
+        if (!doc) {
+          doc = Automerge.from({
+            pages: [{ questionRows: [{ elements: [{ questionText: "" }] }] }],
+            tiles: [], merges: [], actions: [],
+            databases: [], connections: [], styles: { theme: {} }
+          });
+          docReady = true; // allow first send
+          render();
+          log("Seeded local doc (no initial FULL yet); docReady=true");
+        }
+
+        // STEP 2: local change
+        doc = Automerge.change(doc, d => setText(d, newVal));
+        const after = getText(doc);
+        render();
+        log(`STEP 2 OK: local change. before="${before}" → after="${after}"`);
+        setStatus("STEP 2 OK: in-memory");
+
+        // STEP 3: send FULL (string) or queue
+        const serial = Automerge.save(doc); // string
+
+        if (wsReady && docReady && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "full", payload: serial }));
+          lastSentHash = hash(serial);
+          log(`STEP 3 OK: sent FULL to server (hash=${lastSentHash})`);
+          setStatus("STEP 3 OK: sent (waiting ACK)");
+        } else {
+          pendingFull = serial;
+          lastSentHash = hash(serial);
+          log(`STEP 3 QUEUED: ws/doc not ready (hash=${lastSentHash})`);
+          setStatus("STEP 3 queued");
+        }
+      } catch (e) {
+        log(`STEP 2/3 FAIL: ${e.message || e}`);
+        setStatus("Apply failed");
+      }
+    };
+  </script>
+</body>
+</html>
